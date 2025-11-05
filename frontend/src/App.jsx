@@ -1,60 +1,114 @@
-import React, { useEffect, useState, useRef } from 'react'
+import React, { useEffect, useState, useRef, useCallback } from 'react'
 import { toast, ToastContainer } from 'react-toastify'
 import 'react-toastify/dist/ReactToastify.css'
 
 const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:5000'
 
-const DEFAULT_TTL_OPTIONS = [
-  { v: 10, label: '10 minutes' },
-  { v: 60, label: '1 hour' },
-  { v: 1440, label: '1 day' }
-]
-
-// color/tag choices
 const TAGS = [
-  { id: '', label: 'None', color: '#ddd' },
+  { id: '', label: 'None', color: '#E6EEF8' },
   { id: 'idea', label: 'Idea', color: '#FFD166' },
   { id: 'goal', label: 'Goal', color: '#06D6A0' },
   { id: 'vent', label: 'Vent', color: '#FF6B6B' },
   { id: 'note', label: 'Note', color: '#9D94FF' }
 ]
 
+const fmtTTL = (secs) => {
+  if (secs === -2) return 'gone'
+  if (secs === -1) return '∞'
+  if (typeof secs !== 'number') return ''
+  if (secs < 60) return `${secs}s`
+  if (secs < 3600) return `${Math.floor(secs / 60)}m`
+  return `${Math.floor(secs / 3600)}h`
+}
+
 export default function App() {
   const [text, setText] = useState('')
-  const [ttlMinutes, setTtlMinutes] = useState(DEFAULT_TTL_OPTIONS[0].v) // minutes
-  const [notes, setNotes] = useState([])
-  const [loading, setLoading] = useState(false)
+  const [ttlMinutes, setTtlMinutes] = useState(1) // default 1 minute
   const [selectedTag, setSelectedTag] = useState('')
-  const notesRef = useRef([])
+  const [notes, setNotes] = useState([]) // each note: {id,text,tag,ttl,orig_ttl}
+  const [loading, setLoading] = useState(false)
+  const [q, setQ] = useState('')
+  const [showOnlyTag, setShowOnlyTag] = useState('')
+  const [dark, setDark] = useState(false)
+  const inputRef = useRef(null)
 
-  useEffect(() => {
-    fetchNotes()
-    const iv = setInterval(fetchNotes, 3000) // poll frequently for TTL updates
-    return () => clearInterval(iv)
-  }, [])
+  // submitRef to avoid stale closures for keyboard handler
+  const submitRef = useRef(() => {})
+  // fetchRef to allow immediate fetch inside handlers if needed
+  const fetchNotesRef = useRef(() => {})
 
-  useEffect(() => {
-    notesRef.current = notes
-  }, [notes])
-
-  async function fetchNotes() {
+  // Fetch notes from backend
+  const fetchNotes = useCallback(async () => {
     try {
       const res = await fetch(`${API_BASE}/notes`)
-      if (!res.ok) {
-        console.error('fetch notes failed', res.status)
-        return
-      }
+      if (!res.ok) return
       const data = await res.json()
-      setNotes(data)
+      // ensure numeric ttl for each note
+      const normalized = (data || []).map((n) => ({
+        ...n,
+        ttl: typeof n.ttl === 'number' ? n.ttl : parseInt(n.ttl || 0, 10) || 0,
+        orig_ttl: typeof n.orig_ttl === 'number' ? n.orig_ttl : parseInt(n.orig_ttl || 0, 10) || 0
+      }))
+      setNotes(normalized)
     } catch (err) {
-      console.error('fetchNotes error', err)
+      console.error('fetch notes error', err)
     }
-  }
+  }, [])
 
-  async function submit(e) {
-    e && e.preventDefault()
+  // keep refs up-to-date
+  useEffect(() => { fetchNotesRef.current = fetchNotes }, [fetchNotes])
+
+  // initial load & poll every 3s to stay in sync with Redis (server TTL truth)
+  useEffect(() => {
+    const storedDark = localStorage.getItem('memorybox:dark')
+    if (storedDark === '1') {
+      setDark(true)
+      document.documentElement.classList.add('dark')
+    }
+    fetchNotes()
+    const poll = setInterval(() => fetchNotesRef.current(), 3000)
+    return () => clearInterval(poll)
+  }, [fetchNotes])
+
+  useEffect(() => {
+    if (dark) {
+      localStorage.setItem('memorybox:dark', '1')
+      document.documentElement.classList.add('dark')
+    } else {
+      localStorage.removeItem('memorybox:dark')
+      document.documentElement.classList.remove('dark')
+    }
+  }, [dark])
+
+  // 1s local ticker that decrements TTLs for displayed notes smoothly.
+  // Backend remains the source of truth; poll (above) syncs every 3s.
+  useEffect(() => {
+    const tick = setInterval(() => {
+      setNotes((prev) => {
+        if (!prev || prev.length === 0) return prev
+        // decrement ttl by 1 second for notes with ttl > 0
+        const next = prev
+          .map((n) => {
+            if (typeof n.ttl !== 'number') return n
+            // When ttl is -2 (gone) or -1 (inf), keep it as-is
+            if (n.ttl > 0) {
+              return { ...n, ttl: n.ttl - 1 }
+            }
+            return n
+          })
+          // Optionally filter out notes that reached <= 0 to avoid showing zeros before server sweep.
+          // But we'll keep them and let the 3s poll remove expired ones. (Keeps UI stable.)
+        return next
+      })
+    }, 1000)
+    return () => clearInterval(tick)
+  }, [])
+
+  // submit function (wrapped), and keep ref pointing to latest
+  const submit = useCallback(async (e) => {
+    if (e && e.preventDefault) e.preventDefault()
     if (!text.trim()) {
-      toast.error('Please enter something to save')
+      toast.error('Type something first 😉')
       return
     }
     setLoading(true)
@@ -67,140 +121,225 @@ export default function App() {
         body: JSON.stringify(payload)
       })
       if (res.ok) {
-        toast.success('Saved')
+        toast.success('Saved — note will expire')
         setText('')
         setSelectedTag('')
-        fetchNotes()
+        setTtlMinutes(1) // reset to default 1 minute
+        // immediately fetch to reflect accurate TTL from server
+        fetchNotesRef.current()
+        inputRef.current?.focus()
       } else {
-        const txt = await res.text()
         toast.error('Save failed')
-        console.error('save failed', res.status, txt)
       }
     } catch (err) {
+      console.error('submit error', err)
       toast.error('Save failed')
-      console.error(err)
     } finally {
       setLoading(false)
     }
-  }
+  }, [text, ttlMinutes, selectedTag])
+  useEffect(() => { submitRef.current = submit }, [submit])
 
+  // delete note
   async function remove(id) {
     try {
       const res = await fetch(`${API_BASE}/notes/${id}`, { method: 'DELETE' })
-      if (res.ok) {
-        toast.info('Deleted')
-      } else {
-        toast.error('Delete failed')
-      }
+      if (res.ok) toast.info('Deleted')
+      else toast.error('Delete failed')
     } catch (err) {
-      toast.error('Delete failed')
       console.error(err)
+      toast.error('Delete failed')
     } finally {
-      fetchNotes()
+      fetchNotesRef.current()
     }
   }
 
-  // format ttl seconds as human readable
-  function formatTTL(secs) {
-    if (secs === -2) return 'gone'
-    if (secs === -1) return 'no expiry'
-    if (typeof secs !== 'number') return ''
-    if (secs < 60) return `${secs}s`
-    if (secs < 3600) return `${Math.floor(secs / 60)}m`
-    return `${Math.floor(secs / 3600)}h`
-  }
+  // keyboard shortcuts: Ctrl/Cmd+Enter => save, Escape => clear editor
+  useEffect(() => {
+    const onKey = (e) => {
+      // if user is typing in an input/textarea it's fine — we still act
+      const isMac = navigator.platform.toUpperCase().includes('MAC')
+      const modifier = isMac ? e.metaKey : e.ctrlKey
+      if (modifier && e.key === 'Enter') {
+        // call latest submit
+        submitRef.current()
+      } else if (e.key === 'Escape') {
+        setText('')
+        inputRef.current?.blur()
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [])
+
+  const filtered = notes.filter((n) => {
+    if (q.trim()) {
+      const s = q.toLowerCase()
+      if (!(String(n.text).toLowerCase().includes(s) || String(n.tag || '').toLowerCase().includes(s))) {
+        return false
+      }
+    }
+    if (showOnlyTag && showOnlyTag !== '') {
+      return n.tag === showOnlyTag
+    }
+    return true
+  })
 
   return (
-    <div className="wrap">
-      <ToastContainer position="top-right" autoClose={1800} hideProgressBar={false} />
-      <main className="card">
-        <h1 className="title">MemoryBox</h1>
+    <div className="app-root">
+      <ToastContainer position="top-right" autoClose={1600} hideProgressBar={false} />
 
-        <form onSubmit={submit} className="form">
-          <textarea
-            placeholder="Jot something quick..."
-            value={text}
-            onChange={(e) => setText(e.target.value)}
-            rows={4}
-          />
-
-          <div style={{ display: 'flex', gap: 8, marginTop: 8, alignItems: 'center' }}>
-            <label style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
-              <span style={{ fontSize: 13, color: '#444' }}>TTL (minutes)</span>
-              <input
-                type="number"
-                min="1"
-                max="10080"
-                value={ttlMinutes}
-                onChange={(e) => setTtlMinutes(e.target.value)}
-                style={{ width: 100, padding: 6, borderRadius: 6, border: '1px solid #e6e8ef' }}
-              />
-            </label>
-
-            <label style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
-              <span style={{ fontSize: 13, color: '#444' }}>Tag</span>
-              <select
-                value={selectedTag}
-                onChange={(e) => setSelectedTag(e.target.value)}
-                style={{ padding: 6, borderRadius: 6, border: '1px solid #e6e8ef' }}
-              >
-                {TAGS.map((t) => (
-                  <option key={t.id} value={t.id}>{t.label}</option>
-                ))}
-              </select>
-            </label>
-
-            <button type="submit" disabled={loading} style={{ marginLeft: 'auto' }}>
-              Save
-            </button>
+      <header className="topbar center-topbar">
+        <div className="brand">
+          <div className="logo">🧠</div>
+          <div>
+            <h1>MemoryBox</h1>
+            <p className="tagline">Jot. Release. Repeat.</p>
           </div>
-        </form>
+        </div>
 
-        <section className="notes" style={{ marginTop: 16 }}>
-          {notes.length === 0 && <p className="muted">No active notes.</p>}
-          {notes.map((n) => {
-            // compute progress: uses ttl and orig_ttl (seconds)
-            const ttl = typeof n.ttl === 'number' ? n.ttl : parseInt(n.ttl || 0)
-            const orig = typeof n.orig_ttl === 'number' ? n.orig_ttl : parseInt(n.orig_ttl || 0)
-            const progress = orig > 0 && ttl >= 0 ? Math.max(0, Math.min(1, ttl / orig)) : 0
-            const tagMeta = TAGS.find((t) => t.id === n.tag) || { color: '#ddd', label: n.tag || '' }
+        <div className="actions">
+          <div className="search">
+            <input
+              placeholder="Search notes or tags..."
+              value={q}
+              onChange={(e) => setQ(e.target.value)}
+              aria-label="Search notes"
+            />
+            <button onClick={() => { setQ(''); inputRef.current?.focus() }} title="Clear search">✖</button>
+          </div>
 
-            return (
-              <article key={n.id} className="note">
-                <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}>
-                  <div>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                      <strong style={{ marginRight: 6 }}>{n.text}</strong>
-                      {tagMeta && tagMeta.id !== '' && (
-                        <span style={{
-                          background: tagMeta.color,
-                          padding: '2px 8px',
-                          borderRadius: 999,
-                          fontSize: 12
-                        }}>{tagMeta.label}</span>
-                      )}
-                    </div>
-                    <div style={{ marginTop: 8 }}>
-                      <div className="progress-outer">
-                        <div className="progress-inner" style={{ width: `${Math.round(progress * 100)}%` }} />
-                      </div>
-                    </div>
-                  </div>
+          <button
+            className="btn ghost"
+            onClick={() => setDark((d) => !d)}
+            title="Toggle dark mode"
+          >
+            {dark ? '🌙 Dark' : '☀️ Light'}
+          </button>
+        </div>
+      </header>
 
-                  <div style={{ textAlign: 'right' }}>
-                    <small style={{ display: 'block', color: '#666' }}>{formatTTL(ttl)}</small>
-                    <button className="link-btn" onClick={() => remove(n.id)} style={{ marginTop: 8 }}>
-                      delete
+      <main className="container centered">
+        <section className="pane composer-pane card">
+          <form className="composer" onSubmit={submit}>
+            <textarea
+              ref={inputRef}
+              placeholder="Jot an idea, thought, or secret... (Ctrl/Cmd+Enter to save)"
+              value={text}
+              onChange={(e) => setText(e.target.value)}
+              rows={7}
+              className="composer-textarea"
+            />
+
+            <div className="composer-row">
+              <div className="controls-left">
+                <label className="ttl" style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                  <span>TTL</span>
+                  <input
+                    style={{ width: 320 }}
+                    type="range"
+                    min="1"
+                    max="1440"
+                    value={ttlMinutes}
+                    onChange={(e) => setTtlMinutes(Number(e.target.value))}
+                  />
+                  <div className="ttl-value" style={{ minWidth: 48 }}>{ttlMinutes}m</div>
+                </label>
+
+                <div className="tag-picker">
+                  {TAGS.map((t) => (
+                    <button
+                      key={t.id}
+                      type="button"
+                      className={`tag-chip ${selectedTag === t.id ? 'active' : ''}`}
+                      style={{ borderColor: selectedTag === t.id ? t.color : 'transparent' }}
+                      onClick={() => setSelectedTag(selectedTag === t.id ? '' : t.id)}
+                      title={t.label}
+                    >
+                      <span className="chip-dot" style={{ background: t.color }} />
+                      <span className="chip-label">{t.label}</span>
                     </button>
-                  </div>
+                  ))}
                 </div>
-              </article>
-            )
-          })}
+              </div>
+
+              <div className="controls-right">
+                <button className="btn primary" type="submit" disabled={loading}>
+                  {loading ? 'Saving…' : 'Save'}
+                </button>
+                <button
+                  type="button"
+                  className="btn ghost"
+                  onClick={() => { setText(''); setSelectedTag(''); setTtlMinutes(1) }}
+                >
+                  Clear
+                </button>
+              </div>
+            </div>
+          </form>
+
+          <div className="help">
+            <h4>Quick tips</h4>
+            <ul>
+              <li><strong>Ctrl/Cmd + Enter</strong> — save</li>
+              <li><strong>Esc</strong> — clear editor</li>
+              <li>Notes automatically expire after the TTL</li>
+            </ul>
+          </div>
         </section>
 
-        <footer className="footer" style={{ marginTop: 12 }}>Temporary notes — they vanish automatically.</footer>
+        <aside className="pane notes-pane">
+          <div className="notes-toolbar">
+            <div className="filter-tags">
+              <label>Filter:</label>
+              <select value={showOnlyTag} onChange={(e) => setShowOnlyTag(e.target.value)}>
+                <option value="">All</option>
+                {TAGS.filter(t => t.id).map(t => <option key={t.id} value={t.id}>{t.label}</option>)}
+              </select>
+            </div>
+
+            <div className="count">{filtered.length} active</div>
+          </div>
+
+          <div className="notes-grid">
+            {filtered.length === 0 && <div className="empty">No active notes — create one!</div>}
+            {filtered.map((n) => {
+              const ttl = typeof n.ttl === 'number' ? n.ttl : parseInt(n.ttl || 0)
+              const orig = typeof n.orig_ttl === 'number' ? n.orig_ttl : parseInt(n.orig_tl || 0) || 0
+              const progress = orig > 0 ? Math.max(0, Math.min(1, ttl / orig)) : 0
+              const tagMeta = TAGS.find(t => t.id === n.tag) || TAGS[0]
+
+              return (
+                <article key={n.id} className="note-card">
+                  <div className="note-top">
+                    <div className="note-tag" style={{ background: tagMeta.color }}>{tagMeta.label}</div>
+                    <div className="note-actions">
+                      <button className="icon-btn" onClick={() => remove(n.id)} title="Delete">🗑</button>
+                    </div>
+                  </div>
+
+                  <div className="note-body">
+                    <p className="note-text">{n.text}</p>
+                  </div>
+
+                  <div className="note-bottom">
+                    <div className="progress-wrap">
+                      <div className="progress-bar">
+                        <div className="progress-fill" style={{ width: `${Math.round(progress * 100)}%` }} />
+                      </div>
+                      <div className="ttl-meta">{fmtTTL(ttl)}</div>
+                    </div>
+                  </div>
+                </article>
+              )
+            })}
+          </div>
+        </aside>
       </main>
+
+      <footer className="footer-note">
+        Clean UI · fast UX — MemoryBox (temporary notes)
+      </footer>
     </div>
   )
 }
