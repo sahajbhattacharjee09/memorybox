@@ -32,9 +32,8 @@ export default function App() {
   const [dark, setDark] = useState(false)
   const inputRef = useRef(null)
 
-  // submitRef to avoid stale closures for keyboard handler
+  // refs to avoid stale closures
   const submitRef = useRef(() => {})
-  // fetchRef to allow immediate fetch inside handlers if needed
   const fetchNotesRef = useRef(() => {})
 
   // Fetch notes from backend
@@ -55,7 +54,6 @@ export default function App() {
     }
   }, [])
 
-  // keep refs up-to-date
   useEffect(() => { fetchNotesRef.current = fetchNotes }, [fetchNotes])
 
   // initial load & poll every 3s to stay in sync with Redis (server TTL truth)
@@ -80,31 +78,22 @@ export default function App() {
     }
   }, [dark])
 
-  // 1s local ticker that decrements TTLs for displayed notes smoothly.
-  // Backend remains the source of truth; poll (above) syncs every 3s.
+  // local 1s ticker that decrements displayed TTLs for smooth UX.
   useEffect(() => {
     const tick = setInterval(() => {
       setNotes((prev) => {
         if (!prev || prev.length === 0) return prev
-        // decrement ttl by 1 second for notes with ttl > 0
-        const next = prev
-          .map((n) => {
-            if (typeof n.ttl !== 'number') return n
-            // When ttl is -2 (gone) or -1 (inf), keep it as-is
-            if (n.ttl > 0) {
-              return { ...n, ttl: n.ttl - 1 }
-            }
-            return n
-          })
-          // Optionally filter out notes that reached <= 0 to avoid showing zeros before server sweep.
-          // But we'll keep them and let the 3s poll remove expired ones. (Keeps UI stable.)
-        return next
+        return prev.map((n) => {
+          if (typeof n.ttl !== 'number') return n
+          if (n.ttl > 0) return { ...n, ttl: n.ttl - 1 }
+          return n
+        })
       })
     }, 1000)
     return () => clearInterval(tick)
   }, [])
 
-  // submit function (wrapped), and keep ref pointing to latest
+  // submit function
   const submit = useCallback(async (e) => {
     if (e && e.preventDefault) e.preventDefault()
     if (!text.trim()) {
@@ -124,8 +113,7 @@ export default function App() {
         toast.success('Saved — note will expire')
         setText('')
         setSelectedTag('')
-        setTtlMinutes(1) // reset to default 1 minute
-        // immediately fetch to reflect accurate TTL from server
+        setTtlMinutes(1)
         fetchNotesRef.current()
         inputRef.current?.focus()
       } else {
@@ -157,11 +145,9 @@ export default function App() {
   // keyboard shortcuts: Ctrl/Cmd+Enter => save, Escape => clear editor
   useEffect(() => {
     const onKey = (e) => {
-      // if user is typing in an input/textarea it's fine — we still act
       const isMac = navigator.platform.toUpperCase().includes('MAC')
       const modifier = isMac ? e.metaKey : e.ctrlKey
       if (modifier && e.key === 'Enter') {
-        // call latest submit
         submitRef.current()
       } else if (e.key === 'Escape') {
         setText('')
@@ -191,7 +177,8 @@ export default function App() {
 
       <header className="topbar center-topbar">
         <div className="brand">
-          <div className="logo">🧠</div>
+          {/* Use the image in public/ as the logo */}
+          <img src="/image.png" alt="MemoryBox logo" className="logo" />
           <div>
             <h1>MemoryBox</h1>
             <p className="tagline">Jot. Release. Repeat.</p>
@@ -305,7 +292,7 @@ export default function App() {
             {filtered.length === 0 && <div className="empty">No active notes — create one!</div>}
             {filtered.map((n) => {
               const ttl = typeof n.ttl === 'number' ? n.ttl : parseInt(n.ttl || 0)
-              const orig = typeof n.orig_ttl === 'number' ? n.orig_ttl : parseInt(n.orig_tl || 0) || 0
+              const orig = typeof n.orig_ttl === 'number' ? n.orig_ttl : parseInt(n.orig_ttl || 0) || 0
               const progress = orig > 0 ? Math.max(0, Math.min(1, ttl / orig)) : 0
               const tagMeta = TAGS.find(t => t.id === n.tag) || TAGS[0]
 
